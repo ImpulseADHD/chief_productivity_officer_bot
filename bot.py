@@ -11,10 +11,14 @@ import random
 
 # Load environment variables from .env file
 load_dotenv()
+# Retrieve Discord Bot Token from environment variables
 DISCORD_BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+# Retrieve default channels from environment variables
+DEFAULT_CHANNELS = os.getenv('DEFAULT_CHANNELS', '')
 
 # Initialize intents
 intents = discord.Intents.default()
+intents.members = True
 intents.messages = True
 intents.guilds = True
 intents.reactions = True
@@ -43,7 +47,8 @@ progress_messages = [
     "What have you completed?"
 ]
 
-# Classes and Functions
+
+# CLASSES
 
 # Class to represent a Checkin Session
 class CheckinSession:
@@ -55,6 +60,50 @@ class CheckinSession:
         self.mentions = mentions
         self.task = None
         self.start_time = datetime.now()  # Track when the session started
+
+# View Class for Buttons
+class ReminderView(View):
+    def __init__(self, session):
+        super().__init__()
+        self.session = session
+
+    @discord.ui.button(label='Join', style=discord.ButtonStyle.success)
+    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user not in self.session.mentions:
+            self.session.mentions.append(interaction.user)
+            await interaction.response.send_message('You have now joined the check-in session.', ephemeral=True)
+        else:
+            await interaction.response.send_message('You have already joined the check-in session.', ephemeral=True)
+
+    @discord.ui.button(label='Leave', style=discord.ButtonStyle.danger)
+    async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user in self.session.mentions:
+            self.session.mentions.remove(interaction.user)
+            await interaction.response.send_message('You have left the check-in session.', ephemeral=True)
+        else:
+            await interaction.response.send_message('You are not part of the check-in session.', ephemeral=True)
+
+    @discord.ui.button(label='End', style=discord.ButtonStyle.primary)
+    async def end(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user in self.session.mentions:
+            self.session.task.cancel()
+            await self.session.channel.send('The check-in session has now ended.')
+        else:
+            await interaction.response.send_message('You are not part of the check-in session.', ephemeral=True)
+
+
+# FUNCTIONS
+
+# Function to parse default channels and populate checkin_channels
+def parse_default_channels():
+    for server_channels in DEFAULT_CHANNELS.split(';'):
+        if server_channels:
+            server, channels = server_channels.split(':')
+            guild_id = int(server.strip('Server'))
+            channel_ids = [int(channel.strip('Channel')) for channel in channels.split(',')]
+            checkin_channels[guild_id] = channel_ids
+# Parse the default channels and populate checkin_channels
+parse_default_channels()
 
 # Function to parse duration strings into seconds
 async def parse_duration(duration_str):
@@ -74,7 +123,7 @@ async def parse_duration(duration_str):
         return value * 86400
     return None
 
-# Helper function to parse mentions
+# Function to parse mentions
 def parse_mentions(ctx, mentions):
     mention_list = mentions.split()
     members = []
@@ -84,42 +133,27 @@ def parse_mentions(ctx, mentions):
         if mention.startswith('<@&'):  # Role mention
             role_id = int(mention.strip('<@&>'))
             role = ctx.guild.get_role(role_id)
+            print(f"Parsed role ID: {role_id}, Role: {role}")
             if role:
                 members.extend(role.members)
-        elif mention.startswith('<@'):  # User mention
-            user_id = int(mention.strip('<@!>'))
+                print(f"Added members from role {role.name}: {[member.id for member in role.members]}")
+        elif mention.startswith('<@!') or mention.startswith('<@'):  # User mention
+            user_id = int(mention.strip('<@!>').strip('<@>'))
             member = ctx.guild.get_member(user_id)
+            print(f"Parsed user ID: {user_id}, Member: {member}")
             if member:
                 members.append(member)
+                print(f"Added member: {member.id}")
     
-    return members
+    # Remove duplicate member ids
+    unique_members = []
+    member_ids = set()
 
-# Helper function to check if a user is a manager
-def is_manager(ctx):
-    guild_id = ctx.guild.id
-    if guild_id not in manager_roles:
-        manager_roles[guild_id] = []
-    if guild_id not in manager_members:
-        manager_members[guild_id] = []
-    
-    user_roles = ctx.author.roles
-    if ctx.author.guild_permissions.administrator or any(role.id in manager_roles[guild_id] for role in user_roles) or ctx.author.id in manager_members[guild_id]:
-        return True
-    return False
-
-
-# Event when the bot is ready
-@bot.event
-async def on_ready():
-    print(f'Bot is ready as {bot.user}')
-    await sync_commands_with_all_guilds()
-    print('Commands synced with all guilds')
-
-# Event when the bot joins a new guild
-@bot.event
-async def on_guild_join(guild):
-    await sync_commands_with_guild(guild)
-    print(f'Synced commands for new guild: {guild.name} (ID: {guild.id})')
+    for member in members:
+        if member.id not in member_ids:
+            unique_members.append(member)
+            member_ids.add(member.id)
+    return unique_members
 
 # Function to sync commands with all guilds the bot is in
 async def sync_commands_with_all_guilds():
@@ -134,7 +168,7 @@ async def sync_commands_with_guild(guild):
     await bot.tree.sync(guild=guild_object)
     print(f'Commands synced with guild: {guild.name} (ID: {guild.id})')
 
-# Task to send reminders
+# Function to send reminders
 async def send_reminders(session):
     last_reminder_time = datetime.now()  # Track the last reminder time
     while True:
@@ -146,12 +180,39 @@ async def send_reminders(session):
             minutes_ago = int(time_difference.total_seconds() // 60)
             time_message = f"{minutes_ago} minutes ago"
             random_progress_message = random.choice(progress_messages)
-            message = f'{session.creator.mention} and {" ".join(member.mention for member in session.mentions)}, {random_progress_message}\nLast reminder: {time_message}'
+            message = f'{" ".join(member.mention for member in session.mentions)}, {random_progress_message}\nLast reminder: {time_message}'
             print(f'Sending reminder to {session.channel} for session by {session.creator}')
             await session.channel.send(message, view=ReminderView(session))
             last_reminder_time = current_time  # Update the last reminder time
         except Exception as e:
             print(f'Error in send_reminders task: {e}')
+
+# Function to create session embed
+def create_session_embed(session):
+    embed = discord.Embed(title="Check-in Session", description="Progress updates", color=discord.Color.blue())
+    embed.add_field(name="Creator", value=session.creator.mention, inline=False)
+    embed.add_field(name="Duration", value=f"{session.duration} seconds", inline=False)
+    embed.add_field(name="Participants", value=", ".join(member.mention for member in session.mentions), inline=False)
+    return embed
+
+
+# EVENTS
+
+# Event when the bot is ready
+@bot.event
+async def on_ready():
+    print(f'Bot is ready as {bot.user}')
+    await sync_commands_with_all_guilds()
+    print('Commands synced with all guilds')
+
+# Event when the bot joins a new guild
+@bot.event
+async def on_guild_join(guild):
+    await sync_commands_with_guild(guild)
+    print(f'Synced commands for new guild: {guild.name} (ID: {guild.id})')
+
+
+# COMMANDS
 
 # Command to set check-in channels
 @bot.hybrid_command(name='checkin_channels', description='Set the channels where check-in commands can be used')
@@ -183,6 +244,7 @@ async def check_perms_cmd(ctx: commands.Context):
 # Command to start a check-in session
 @bot.hybrid_command(name='checkin', description='Start a check-in session')
 async def checkin_cmd(ctx: commands.Context, duration: str, *, mentions: str):
+    
     # Check if there are channels defined for the guild
     guild_id = ctx.guild.id
     guild_name = ctx.guild.name
@@ -197,15 +259,17 @@ async def checkin_cmd(ctx: commands.Context, duration: str, *, mentions: str):
         await ctx.send('Invalid duration. Minimum duration is 30 seconds.')
         print(f'Invalid duration provided: {duration}')
         return
-
     print(f'Parsed duration (in seconds): {duration_seconds}')
 
     # Parse mentions
     members = parse_mentions(ctx, mentions)
 
+    print(f'\n\nDuration: {duration_seconds}\nMentions: {mentions}\nMembers: {members}\nAuthor: {ctx.author}')
+
     # Include the creator in the mentions list
     if ctx.author not in members:
         members.append(ctx.author)
+        print(f'\nFinal Member List: {members}\n\n')
 
     session = CheckinSession(guild_id=guild_id, channel=ctx.channel, creator=ctx.author, duration=duration_seconds, mentions=members)
 
@@ -220,9 +284,12 @@ async def checkin_cmd(ctx: commands.Context, duration: str, *, mentions: str):
     # Send initial session start message with embed and buttons
     # embed = create_session_embed(session)
     # view = ReminderView(session)
-    await ctx.send(f'Check-in session started for {duration}!', embed=embed, view=view)
+    member_str = " ".join(member.mention for member in members)
+    await ctx.send(f'{member_str}\nCheck-in session started for {duration}!', view=ReminderView(session)) # The ReminderView in this part is untested.
     print(f'Check-in session created: {session}')
 
+
+# RUN THE BOT
 
 # Run the bot
 bot.run(DISCORD_BOT_TOKEN)
@@ -230,15 +297,18 @@ bot.run(DISCORD_BOT_TOKEN)
 ##########################################################################################################################
 
 '''
-
-# Helper function to create session embed
-def create_session_embed(session):
-    embed = discord.Embed(title="Check-in Session", description="Progress updates", color=discord.Color.blue())
-    embed.add_field(name="Creator", value=session.creator.mention, inline=False)
-    embed.add_field(name="Duration", value=f"{session.duration} seconds", inline=False)
-    embed.add_field(name="Participants", value=", ".join(member.mention for member in session.mentions), inline=False)
-    return embed
-
+# Helper function to check if a user is a manager
+def is_manager(ctx):
+    guild_id = ctx.guild.id
+    if guild_id not in manager_roles:
+        manager_roles[guild_id] = []
+    if guild_id not in manager_members:
+        manager_members[guild_id] = []
+    
+    user_roles = ctx.author.roles
+    if ctx.author.guild_permissions.administrator or any(role.id in manager_roles[guild_id] for role in user_roles) or ctx.author.id in manager_members[guild_id]:
+        return True
+    return False
 
 # Command to add managers
 @bot.hybrid_command(name='add_managers', description='Add roles or members as managers')
@@ -281,37 +351,5 @@ async def view_managers_cmd(ctx: commands.Context):
     embed.add_field(name="Members", value=", ".join(member.display_name for member in members if member), inline=False)
 
     await ctx.send(embed=embed)
-
-
-
-class ReminderView(View):
-    def __init__(self, session):
-        super().__init__()
-        self.session = session
-
-    @discord.ui.button(label='Join', style=discord.ButtonStyle.success)
-    async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user not in self.session.mentions:
-            self.session.mentions.append(interaction.user)
-            await interaction.response.send_message('You have now joined the check-in session.', ephemeral=True)
-        else:
-            await interaction.response.send_message('You have already joined the check-in session.', ephemeral=True)
-
-    @discord.ui.button(label='Leave', style=discord.ButtonStyle.danger)
-    async def leave(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user in self.session.mentions:
-            self.session.mentions.remove(interaction.user)
-            await interaction.response.send_message('You have left the check-in session.', ephemeral=True)
-        else:
-            await interaction.response.send_message('You are not part of the check-in session.', ephemeral=True)
-
-    @discord.ui.button(label='End', style=discord.ButtonStyle.primary)
-    async def end(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user in self.session.mentions:
-            self.session.task.cancel()
-            await self.session.channel.send('The check-in session has now ended.')
-        else:
-            await interaction.response.send_message('You are not part of the check-in session.', ephemeral=True)
-
 
 '''
